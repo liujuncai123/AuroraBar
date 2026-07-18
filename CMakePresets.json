@@ -1,0 +1,43 @@
+{
+    "version": 3,
+    "configurePresets": [
+        {
+            "name": "msvc2022-debug",
+            "displayName": "MSVC 2022 Debug",
+            "description": "MSVC 2022 + Qt 6.10.3 + spdlog Debug",
+            "generator": "Visual Studio 17 2022",
+            "architecture": "x64",
+            "toolchainFile": "C:/vcpkg-2026.04.27/vcpkg-2026.04.27/scripts/buildsystems/vcpkg.cmake",
+            "binaryDir": "${sourceDir}/build/debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_PREFIX_PATH": "C:/Qt/6.10.3/msvc2022_64"
+            }
+        },
+        {
+            "name": "msvc2022-release",
+            "displayName": "MSVC 2022 Release",
+            "description": "MSVC 2022 + Qt 6.10.3 + spdlog Release",
+            "generator": "Visual Studio 17 2022",
+            "architecture": "x64",
+            "toolchainFile": "C:/vcpkg-2026.04.27/vcpkg-2026.04.27/scripts/buildsystems/vcpkg.cmake",
+            "binaryDir": "${sourceDir}/build/release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_PREFIX_PATH": "C:/Qt/6.10.3/msvc2022_64"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "debug",
+            "configurePreset": "msvc2022-debug",
+            "configuration": "Debug"
+        },
+        {
+            "name": "release",
+            "configurePreset": "msvc2022-release",
+            "configuration": "Release"
+        }
+    ]
+}
