@@ -10,7 +10,7 @@ __declspec(dllexport) unsigned long NvOptimusEnablement = 1;
 __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 }
 
-#include "mainwindow.h"
+#include "src/ui/mainwindow.h"
 
 // 日志（提前 include，供 doQtExec 的主线程心跳使用 AURORA_INFO）
 #include "src/logging/LoggerManager.h"

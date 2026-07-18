@@ -30,10 +30,10 @@ qt_standard_project_setup()
 # 主程序源文件
 # ============================================================
 set(SOURCES
-    main.cpp
-    mainwindow.cpp
-    mainwindow.h
-    mainwindow.ui
+    src/main.cpp
+    src/ui/mainwindow.cpp
+    src/ui/mainwindow.h
+    src/ui/mainwindow.ui
     # 核心基础设施
     src/core/ThreadBase.h
     src/core/ThreadBase.cpp
@@ -195,13 +195,35 @@ target_link_libraries(AuroraBar
 )
 
 # ============================================================
-# 构建后复制 icon.png 到 exe 同目录（托盘图标用）
+# 构建后自动部署：复制 icon + 补 Qt6OpenGL + windeployqt
+# 注意：不能直接用 CMAKE_PREFIX_PATH 复制 DLL，因为 vcpkg 会将其拼接为多路径
 # ============================================================
+
+# Qt bin 目录（用于复制 windeployqt 漏检的 DLL）
+# 安全：优先取 Qt6Core 的位置，fallback 到 CMAKE_PREFIX_PATH
+get_target_property(QT6CORE_LOCATION Qt6::Core LOCATION)
+get_filename_component(QT_BIN_DIR "${QT6CORE_LOCATION}" DIRECTORY)
+
 add_custom_command(TARGET AuroraBar POST_BUILD
+    # 复制 icon.png（托盘图标用）
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/res/icon.png"
         "$<TARGET_FILE_DIR:AuroraBar>/icon.png"
-    COMMENT "Copying icon.png to output directory"
+    # 补充 windeployqt 漏检测的 Qt6OpenGL*.dll
+    # 注意：Debug 模式用 Qt6OpenGLd.dll，Release 用 Qt6OpenGL.dll
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${QT_BIN_DIR}/$<IF:$<CONFIG:Debug>,Qt6OpenGLd.dll,Qt6OpenGL.dll>"
+        "$<TARGET_FILE_DIR:AuroraBar>/$<IF:$<CONFIG:Debug>,Qt6OpenGLd.dll,Qt6OpenGL.dll>"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${QT_BIN_DIR}/$<IF:$<CONFIG:Debug>,Qt6OpenGLWidgetsd.dll,Qt6OpenGLWidgets.dll>"
+        "$<TARGET_FILE_DIR:AuroraBar>/$<IF:$<CONFIG:Debug>,Qt6OpenGLWidgetsd.dll,Qt6OpenGLWidgets.dll>"
+    COMMENT "Copying icon.png + Qt6OpenGL DLLs"
+)
+
+# windeployqt 必须在 vcpkg applocal 之后运行
+add_custom_command(TARGET AuroraBar POST_BUILD
+    COMMAND "${QT_BIN_DIR}/windeployqt.exe" --no-translations --no-opengl-sw "$<TARGET_FILE:AuroraBar>"
+    COMMENT "Running windeployqt for Qt runtime DLLs"
 )
 
 # ============================================================
