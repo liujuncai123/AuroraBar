@@ -222,8 +222,8 @@ void ParticleFlowEffect::spawnParticles(float dt) {
         float threshold = static_cast<float>(ps.GetDouble("concerto.threshold"));
         if (energy < threshold) continue;
 
-        // spawn 速率 = energy * 50 /s
-        m_spawnAccum[segIdx] += energy * 50.0f * dt;
+        // spawn 速率 = energy * kParticleSpawnRate /s
+        m_spawnAccum[segIdx] += energy * kParticleSpawnRate * dt;
         int spawnCount = static_cast<int>(m_spawnAccum[segIdx]);
         m_spawnAccum[segIdx] -= spawnCount;
 

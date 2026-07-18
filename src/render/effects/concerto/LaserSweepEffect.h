@@ -81,6 +81,8 @@ private:
     int m_maxLineVerts = 0;
     int m_maxPointVerts = 0;
 
+    static constexpr int kLaserTrailMaxVerts = 100;  ///< 激光拖尾最大顶点数
+
     std::array<float, 16> m_cachedProj{};
     float m_cachedSW = -1.0f, m_cachedSH = -1.0f;
 

@@ -97,6 +97,8 @@ private:
     int m_vertCount = 0;
     int m_maxVerts = 0;
 
+    static constexpr float kParticleSpawnRate = 50.0f;  ///< 粒子生成速率（粒子/秒/段，满能量时）
+
     std::array<float, 16> m_cachedProj{};
     float m_cachedSW = -1.0f, m_cachedSH = -1.0f;
 

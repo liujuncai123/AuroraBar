@@ -43,6 +43,22 @@ extern SPSCQueue<ControlCommand, 16> g_controlQueue;
 // SEH 包装器（实现在 src/core/ThreadSEH.cpp）
 void LogicThread_onRun_SEH(class LogicThread* self);
 
+// ---- 段角色混合权重：控制谐波/打击/总能量在不同角色中的占比 ----
+//   HarmonicMain: 主谐波段，70% 谐波 + 20% 打击 + 10% 总能量
+//   PercussiveMain: 主打击段，70% 打击 + 20% 谐波 + 10% 总能量
+//   Aux/Weak: 逐步降低主职责权重，增加辅职责比例
+struct RoleMix {
+    double harmonicW;   ///< 谐波能量权重
+    double percussiveW; ///< 打击能量权重
+    double bandW;       ///< 总能量权重
+};
+constexpr RoleMix kRoleMixTable[] = {
+    // HarmonicMain,   HarmonicAux,    HarmonicWeak,
+    { 0.70, 0.20, 0.10 }, { 0.65, 0.25, 0.10 }, { 0.50, 0.35, 0.15 },
+    // PercussiveMain,  PercussiveAux,  PercussiveWeak
+    { 0.20, 0.70, 0.10 }, { 0.25, 0.65, 0.10 }, { 0.35, 0.50, 0.15 },
+};
+
 class LogicThread : public ThreadBase {
 public:
     LogicThread() : ThreadBase("Logic") {}
@@ -116,8 +132,8 @@ protected:
         }
 
         // ---- 协奏模式：HPSS 历史最大值归一化 ----
-        m_harmonicMaxHist.resize(segCount, 1e-6);
-        m_percussiveMaxHist.resize(segCount, 1e-6);
+        m_harmonicMaxHist.resize(segCount, kHpssMinInit);
+        m_percussiveMaxHist.resize(segCount, kHpssMinInit);
 
         // ---- 过渡管理器 ----
         m_transition.rebuild(segCount);
@@ -212,12 +228,12 @@ public:
             double fluxSum = 0.0;
             for (auto v : m_features.spectralFlux) fluxSum += v;
             // 指数衰减的历史平均值
-            m_fluxAvg = m_fluxAvg * 0.95 + fluxSum * 0.05;
-            // 峰值超过历史平均 2.5 倍时触发 onset
-            if (fluxSum > m_fluxAvg * 2.5 && fluxSum > 0.1) {
+            m_fluxAvg = m_fluxAvg * kOnsetEmaOneMinusAlpha + fluxSum * kOnsetEmaAlpha;
+            // 峰值超过历史平均 kOnsetThresholdRatio 倍时触发 onset
+            if (fluxSum > m_fluxAvg * kOnsetThresholdRatio && fluxSum > kOnsetMinFlux) {
                 RenderCommand onsetCmd;
                 onsetCmd.type = RenderCommand::Type::Onset;
-                onsetCmd.paramValue = std::min(1.0, fluxSum / (m_fluxAvg * 2.5 + 0.01));
+                onsetCmd.paramValue = std::min(1.0, fluxSum / (m_fluxAvg * kOnsetThresholdRatio + kOnsetEpsilon));
                 g_renderQueue.tryPush(onsetCmd);
             }
         }
@@ -257,28 +273,21 @@ public:
                     // 归一化：谐波/打击能量用历史最大值归一化到 [0,1]（与 BandEnergy 一致）
                     // 安全：防除零，初始值 1e-6
                     if (i < m_harmonicMaxHist.size()) {
-                        m_harmonicMaxHist[i]   = std::max(harmonic,   m_harmonicMaxHist[i]   * 0.999);
-                        m_percussiveMaxHist[i] = std::max(percussive, m_percussiveMaxHist[i] * 0.999);
-                        harmonic   = (m_harmonicMaxHist[i]   > 1e-9) ? harmonic   / m_harmonicMaxHist[i]   : 0.0;
-                        percussive = (m_percussiveMaxHist[i] > 1e-9) ? percussive / m_percussiveMaxHist[i] : 0.0;
+                        m_harmonicMaxHist[i]   = std::max(harmonic,   m_harmonicMaxHist[i]   * kHpssMaxDecay);
+                        m_percussiveMaxHist[i] = std::max(percussive, m_percussiveMaxHist[i] * kHpssMaxDecay);
+                        harmonic   = (m_harmonicMaxHist[i]   > kHpssMinThreshold) ? harmonic   / m_harmonicMaxHist[i]   : 0.0;
+                        percussive = (m_percussiveMaxHist[i] > kHpssMinThreshold) ? percussive / m_percussiveMaxHist[i] : 0.0;
                     }
 
-                    // 角色混合：主职责 70% + 辅职责 20% + 总能量 10%
-                    switch (seg.role) {
-                    case SegmentRole::HarmonicMain:
-                        driveValue = harmonic * 0.7 + percussive * 0.2 + band * 0.1; break;
-                    case SegmentRole::HarmonicAux:
-                        driveValue = harmonic * 0.65 + percussive * 0.25 + band * 0.1; break;
-                    case SegmentRole::HarmonicWeak:
-                        driveValue = harmonic * 0.5 + percussive * 0.35 + band * 0.15; break;
-                    case SegmentRole::PercussiveMain:
-                        driveValue = percussive * 0.7 + harmonic * 0.2 + band * 0.1; break;
-                    case SegmentRole::PercussiveAux:
-                        driveValue = percussive * 0.65 + harmonic * 0.25 + band * 0.1; break;
-                    case SegmentRole::PercussiveWeak:
-                        driveValue = percussive * 0.5 + harmonic * 0.35 + band * 0.15; break;
-                    default:
-                        driveValue = band; break;
+                    // 角色混合：查表（RoleMix 配置表，单点修改全局生效）
+                    auto roleIdx = static_cast<int>(seg.role);
+                    if (roleIdx >= 0 && roleIdx < 6) {
+                        const auto& mix = kRoleMixTable[roleIdx];
+                        driveValue = harmonic * mix.harmonicW
+                                   + percussive * mix.percussiveW
+                                   + band * mix.bandW;
+                    } else {
+                        driveValue = band;  // 未知角色：仅总能量
                     }
                 }
 
@@ -302,22 +311,22 @@ public:
                 rawValues[i] = m_physicsStates[i].currentValue();
             }
         }
-        // 使用缩放后的 RMS（×200），避免休眠态误判（原始 RMS 太小，0.001~0.01）
-        double rmsScaled = std::max(0.0, std::min(1.0, m_features.rms * 200.0));
+        // 使用缩放后的 RMS（×kRmsScaleFactor），避免休眠态误判（原始 RMS 太小，0.001~0.01）
+        double rmsScaled = std::max(0.0, std::min(1.0, m_features.rms * kRmsScaleFactor));
 
         // 同步休眠参数（每帧检查，响应 UI 变更）
         m_transition.setStateRmsThreshold(ps.GetDouble("dormantThreshold"));
         m_transition.setStateSilenceTimeout(ps.GetDouble("dormantDelay"));
-        // 休眠行为：保持呼吸→0.15，渐隐→0.0
-        m_transition.setDormantTarget(ps.GetInt("dormantBehavior") == 0 ? 0.15 : 0.0);
+        // 休眠行为：保持呼吸→kDormantTargetBreathing，渐隐→0.0
+        m_transition.setDormantTarget(ps.GetInt("dormantBehavior") == 0 ? kDormantTargetBreathing : 0.0);
 
-        m_transition.update(rmsScaled, rawValues, 1.0 / 48.0);
+        m_transition.update(rmsScaled, rawValues, kTransitionDt);
 
         // ---- 休眠态联动：状态变化时发送 DormantState RenderCommand ----
         {
             auto newState = m_transition.lifeState();
             double newCoeff = m_transition.stateCoeff();
-            if (newState != m_lastLifeState || std::abs(newCoeff - m_lastStateCoeff) > 0.05) {
+            if (newState != m_lastLifeState || std::abs(newCoeff - m_lastStateCoeff) > kDormantStateCoeffThreshold) {
                 RenderCommand dormCmd;
                 dormCmd.type = RenderCommand::Type::DormantState;
                 dormCmd.paramValue = newCoeff;
@@ -336,8 +345,8 @@ public:
 
         // 每段一个 RenderCommand
         size_t segCount = (mode == 2) 
-            ? m_physicsStates.size()                    // 协奏：全部段
-            : std::min(m_physicsStates.size(), static_cast<size_t>(16));  // 循环：限 16
+            ? m_physicsStates.size()                         // 协奏：全部段
+            : std::min(m_physicsStates.size(), kMaxCycleSegments);  // 循环：限 kMaxCycleSegments
         for (size_t i = 0; i < segCount; ++i) {
             // 协奏模式：跳过 TransitionManager 参数平滑，ConcertoRenderer 自带 EMA
             cmd.paramValue = (mode == 2)
@@ -359,11 +368,11 @@ public:
             g_renderQueue.tryPush(cmd);
         };
 
-        pushNamed("flowSpeed",    0.01 + rmsScaled * 0.8);    // 安静 0.01 → 音乐 0.81
-        pushNamed("emissionRate", rmsScaled);                  // 完全由音乐驱动：无声=0，有声=0~1
-        pushNamed("brightness",   0.5 + rmsScaled * 0.5);    // 安静 0.5(可见) → 音乐 1.0(满亮)
-        pushNamed("rawRms",       m_features.rms);             // BounceBall 模式：原始 RMS 用于计算差值推力
-        pushNamed("curvatureDepth", 0.85 - rmsScaled * 0.55); // 曲率 RMS 驱动：安静→深凹(0.85)，激烈→浅凹(0.30)
+        pushNamed("flowSpeed",    kFlowSpeedBase + rmsScaled * kFlowSpeedRange);    // 安静 → 音乐
+        pushNamed("emissionRate", rmsScaled);                                  // 完全由音乐驱动：无声=0，有声=0~1
+        pushNamed("brightness",   kBrightnessBase + rmsScaled * kBrightnessRange); // 安静 → 满亮
+        pushNamed("rawRms",       m_features.rms);                             // BounceBall 模式：原始 RMS 用于计算差值推力
+        pushNamed("curvatureDepth", kCurvatureBase - rmsScaled * kCurvatureRange); // 安静→深凹，激烈→浅凹
     }
 
 protected:
@@ -378,6 +387,50 @@ protected:
     }
 
 private:
+    // ---- 音频响应调优常量（单点修改，全局生效）----
+
+    /// Onset 检测（频谱通量峰值触发）
+    static constexpr double kOnsetEmaAlpha        = 0.05;  ///< EMA 平滑系数（越小越慢）
+    static constexpr double kOnsetEmaOneMinusAlpha = 0.95;  ///< 1 - α
+    static constexpr double kOnsetThresholdRatio   = 2.5;   ///< 峰值/历史平均倍数
+    static constexpr double kOnsetMinFlux          = 0.1;   ///< 最小通量（防噪声误触发）
+    static constexpr double kOnsetEpsilon          = 0.01;  ///< 防除零
+
+    /// RMS 缩放（原始 RMS 0.001~0.01，×200 映射到 [0,1]）
+    static constexpr double kRmsScaleFactor = 200.0;
+
+    /// HPSS 历史最大值归一化
+    static constexpr double kHpssMaxDecay     = 0.999; ///< 指数衰减系数
+    static constexpr double kHpssMinInit      = 1e-6;  ///< 历史最大值初始值（防除零）
+    static constexpr double kHpssMinThreshold = 1e-9;  ///< 归一化除零阈值
+
+    /// 段数限制
+    static constexpr size_t kMaxCycleSegments = 16; ///< 循环/弹球模式段数上限
+
+    /// 休眠态参数
+    static constexpr double kDormantTargetBreathing  = 0.15; ///< 保持呼吸时的目标值
+    static constexpr double kDormantStateCoeffThreshold = 0.05; ///< 状态变化推送阈值
+
+    /// 过渡/平滑
+    static constexpr double kTransitionDt = 1.0 / 48.0; ///< 过渡器更新步长
+
+    /// RMS 驱动的全局参数映射范围
+    static constexpr double kFlowSpeedBase    = 0.01; ///< 安静时流速
+    static constexpr double kFlowSpeedRange   = 0.80; ///< 音乐时流速增量
+    static constexpr double kBrightnessBase   = 0.50; ///< 安静时亮度
+    static constexpr double kBrightnessRange  = 0.50; ///< 音乐时亮度增量
+    static constexpr double kCurvatureBase    = 0.85; ///< 安静时曲率（深凹）
+    static constexpr double kCurvatureRange   = 0.55; ///< 音乐时曲率减量
+
+    /// 音乐驱动颜色
+    static constexpr double kMusicColorMinPeak     = 0.01;  ///< 最小峰值（防静音乱跳）
+    static constexpr float  kMusicColorHueMaxDeg   = 280.0f; ///< 最大色相（红→紫）
+    static constexpr float  kMusicColorSaturation  = 0.85f;  ///< HSV 饱和度
+    static constexpr float  kMusicColorValue       = 1.0f;   ///< HSV 亮度
+    static constexpr float  kMusicColorEmaAlpha    = 0.1f;   ///< EMA 平滑系数
+    static constexpr float  kMusicColorEmaOneMinusAlpha = 0.9f; ///< 1 - α
+
+    // ---- 成员函数 ----
     /// @brief 同步分段状态：段数变化时重建物理状态、过渡器、HPSS 历史
     void syncSegmentation() {
         auto& segMgr = SegmentationManager::Instance();
@@ -545,7 +598,7 @@ private:
                 }
             }
             // 峰值过小：不更新 EMA（保持上一次颜色，避免静音时颜色乱跳）
-            if (peakMag >= 0.01) {
+            if (peakMag >= kMusicColorMinPeak) {
                 // ---- 2. 反向计算 band 中心频率 ----
                 // FftProcessor::buildBandMap 的对数映射：log(20) → log(22050)
                 // band 索引均匀分布在 [logMin, logMax] 上，中心位置 = (b + 0.5) / (bandCount - 1)
@@ -564,10 +617,10 @@ private:
                 const double hueRatio =
                     (std::log(clampedFreq) - std::log(kFreqMin))
                     / (std::log(kFreqMax) - std::log(kFreqMin));
-                const float hue = static_cast<float>(hueRatio * 280.0);  // 0°~280°
+                const float hue = static_cast<float>(hueRatio * kMusicColorHueMaxDeg);  // 0°~kMusicColorHueMaxDeg°
 
-                // ---- 4. HSV → RGB (S=0.85, V=1.0) ----
-                const float s = 0.85f, v = 1.0f;
+                // ---- 4. HSV → RGB (S=kMusicColorSaturation, V=kMusicColorValue) ----
+                const float s = kMusicColorSaturation, v = kMusicColorValue;
                 const float c = v * s;
                 const float hp = hue / 60.0f;
                 const float x = c * (1.0f - std::abs(std::fmod(hp, 2.0f) - 1.0f));
@@ -581,10 +634,10 @@ private:
                 const float m = v - c;
                 r += m; g += m; bb += m;
 
-                // ---- 5. EMA 平滑（α=0.1，慢响应避免闪烁）----
-                m_audioColorEMA[0] = m_audioColorEMA[0] * 0.9f + r  * 0.1f;
-                m_audioColorEMA[1] = m_audioColorEMA[1] * 0.9f + g  * 0.1f;
-                m_audioColorEMA[2] = m_audioColorEMA[2] * 0.9f + bb * 0.1f;
+                // ---- 5. EMA 平滑（α=kMusicColorEmaAlpha，慢响应避免闪烁）----
+                m_audioColorEMA[0] = m_audioColorEMA[0] * kMusicColorEmaOneMinusAlpha + r  * kMusicColorEmaAlpha;
+                m_audioColorEMA[1] = m_audioColorEMA[1] * kMusicColorEmaOneMinusAlpha + g  * kMusicColorEmaAlpha;
+                m_audioColorEMA[2] = m_audioColorEMA[2] * kMusicColorEmaOneMinusAlpha + bb * kMusicColorEmaAlpha;
             }
         }
 

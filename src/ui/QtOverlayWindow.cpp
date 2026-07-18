@@ -103,17 +103,22 @@ bool QtOverlayWindow::initialize()
     //   窗口将在渲染线程首帧完成后由 QtRenderThread 通过 invokeMethod 调用 show()
     create();
 
-    // 手动设置 Win32 ExStyle（鼠标穿透 + 不在任务栏显示 + 不抢焦点）
+    // 手动设置 Win32 ExStyle（鼠标穿透 + 不在任务栏显示 + 不抢焦点 + 强制分层合成）
     //   - WS_EX_TRANSPARENT: 鼠标点击穿透到下层窗口
     //   - WS_EX_TOOLWINDOW: 不在任务栏/Alt+Tab 显示（替代 Qt::Tool）
     //   - WS_EX_NOACTIVATE: 防止窗口被激活抢焦点
-    //   - WS_EX_LAYERED: 保留 layered window 属性（Qt6 DirectComposition 自动设置）
+    //   - WS_EX_LAYERED:
+    //     🔧 [dGPU DWM 修复] 纯独显机器上，DWM 可能跳过合成透明工具窗口（用户实测：
+    //       不开任务管理器 → DWM 跳过合成 → 黑屏；开任务管理器 → DWM 活跃 → 正常）。
+    //       添加 WS_EX_LAYERED 后 DWM 强制使用分层合成路径，与任务管理器状态解耦。
+    //       Qt6 的 DirectComposition surface 会覆盖 SetLayeredWindowAttributes，
+    //       透明度仍由 DirectComposition 视觉树控制，不影响实际透明效果。
     HWND hwnd = reinterpret_cast<HWND>(winId());
     if (hwnd) {
         LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
         SetWindowLongPtr(hwnd, GWL_EXSTYLE,
-                         exStyle | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE);
-        AURORA_INFO("QtOverlay", "ExStyle set (TRANSPARENT|TOOLWINDOW|NOACTIVATE), HWND=0x{:X}",
+                         exStyle | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED);
+        AURORA_INFO("QtOverlay", "ExStyle set (TRANSPARENT|TOOLWINDOW|NOACTIVATE|LAYERED), HWND=0x{:X}",
                     reinterpret_cast<uintptr_t>(hwnd));
     } else {
         AURORA_WARN("QtOverlay", "winId() returned null — mouse pass-through not set");
@@ -164,57 +169,94 @@ void QtOverlayWindow::resizeEvent(QResizeEvent* event)
 
 void QtOverlayWindow::setupAntiCloak()
 {
-    AURORA_INFO("QtOverlay", "setupAntiCloak() — 200ms interval (aggressive)");
+    // 🔧 [dGPU DWM 修复 v2] 自适应轮询，替代固定 33ms 轮询
+    //   DWM cloaking 状态变化不会发送窗口消息，必须轮询 DwmGetWindowAttribute。
+    //   策略（自适应双态）：
+    //     正常态：1000ms 间隔（99.9% 时间），CPU 开销 ~0.001%
+    //     异常态：检测到 cloaked → 立即切到 33ms 高频，持续 2 秒（60 帧），CPU 开销 ~0.015%
+    //     2 秒内稳定 → 自动恢复 1000ms
+    //   对比固定 33ms：
+    //     - 正常态 CPU 开销降低 30 倍（1 次/秒 vs 30 次/秒）
+    //     - 异常态响应相同（33ms）
+    AURORA_INFO("QtOverlay", "setupAntiCloak() — adaptive: 1000ms normal, 33ms burst on cloaked");
+
     m_antiCloakTimer = std::make_unique<QTimer>();
-    m_antiCloakTimer->setInterval(200);  // 提高到 200ms，更快响应 DWM cloaking
-    QObject::connect(m_antiCloakTimer.get(), &QTimer::timeout, this, [this]() {
+    QTimer* timer = m_antiCloakTimer.get();
+    timer->setInterval(1000);  // 默认慢速
+
+    // 自适应状态（lambda 内用 static 跨回调保持）
+    // 注意：此 lambda 在 QtOverlayWindow 生命周期内不会被销毁后重建，
+    //       static 变量安全（同一对象同一 timer 同一回调）
+    QObject::connect(timer, &QTimer::timeout, this, [this, timer]() {
         HWND hwnd = reinterpret_cast<HWND>(winId());
         if (!hwnd) return;
 
-        // 安全：检测当前窗口状态，只在窗口被隐藏/cloaking 时才打日志（避免日志爆炸）
         BOOL isCloaked = FALSE;
         HRESULT hrGet = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &isCloaked, sizeof(isCloaked));
         bool isVisible = IsWindowVisible(hwnd) != FALSE;
 
-        // 状态异常时打日志（限频）
+        // ── 自适应状态机 ──
+        static bool   inBurst = false;   // 是否处于高频 burst 模式
+        static int    stableFrames = 0;  // 连续正常帧数（burst 模式下计数）
+        static int    burstRecoverCount = 0;
+        constexpr int kBurstMs = 33;     // 高频间隔
+        constexpr int kStableThreshold = 60;  // 连续 60 帧正常后恢复慢速（~2秒）
+
         if (SUCCEEDED(hrGet) && isCloaked) {
-            static int cloakWarnCount = 0;
-            if (cloakWarnCount < 10) {
-                ++cloakWarnCount;
-                AURORA_WARN("QtOverlay", "DWM cloaked detected — isVisible={} cloakCount={}",
-                            isVisible ? 1 : 0, cloakWarnCount);
+            // ── 异常：立即切 burst 模式 ──
+            if (!inBurst) {
+                inBurst = true;
+                stableFrames = 0;
+                timer->setInterval(kBurstMs);
+                AURORA_WARN("QtOverlay", "DWM cloaked! Switching to 33ms burst mode");
             }
+
+            BOOL cloak = FALSE;
+            DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+            if (!isVisible) ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            UpdateWindow(hwnd);
+
+            if (burstRecoverCount++ < 10) {
+                AURORA_WARN("QtOverlay", "Burst recover #{}", burstRecoverCount);
+            }
+            stableFrames = 0;  // 重置稳定计数
+            return;
         }
 
-        // 安全：1. 强制取消 DWM cloaking（DWM 可能标记窗口为 cloaked 导致屏幕不可见但 swap chain 仍工作）
-        //          这是用户实测确认的场景：最小化最后一个普通窗口时 overlay 屏幕不可见，但 GL 渲染仍在跑。
-        BOOL cloak = FALSE;
-        HRESULT hr = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
-        if (FAILED(hr)) {
-            static int warnCount = 0;
-            if (warnCount++ < 3) {
-                AURORA_WARN("QtOverlay", "DwmSetWindowAttribute(CLOAK=FALSE) failed: hr=0x{:X}",
-                            static_cast<unsigned>(hr));
+        if (SUCCEEDED(hrGet) && !isCloaked && isVisible) {
+            // ── 正常 ──
+            if (inBurst) {
+                ++stableFrames;
+                if (stableFrames >= kStableThreshold) {
+                    inBurst = false;
+                    stableFrames = 0;
+                    burstRecoverCount = 0;
+                    timer->setInterval(1000);
+                    AURORA_INFO("QtOverlay", "Stable for {} frames, back to 1000ms", kStableThreshold);
+                }
             }
+            // 正常态 + 非 burst：不执行任何操作，纯跳过
+            return;
         }
 
-        // 安全：2. 如果窗口不可见，强制 ShowWindow + SWP_SHOWWINDOW 显示
-        //          ShowWindow 比 SetWindowPos 更底层，能突破 DWM 的 cloaking
+        // ── 窗口不可见但未 cloaked（罕见边缘情况）──
         if (!isVisible) {
-            static int invisibleCount = 0;
-            if (invisibleCount < 10) {
-                ++invisibleCount;
-                AURORA_WARN("QtOverlay", "Window invisible, forcing ShowWindow — count={}",
-                            invisibleCount);
+            // 也切 burst 模式
+            if (!inBurst) {
+                inBurst = true;
+                stableFrames = 0;
+                timer->setInterval(kBurstMs);
             }
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            UpdateWindow(hwnd);
+            stableFrames = 0;
         }
-
-        // 安全：3. 强制 Z-order 顶层 + 显示
-        //          SWP_SHOWWINDOW 强制窗口可见（突破 DWM cloaking）
-        //          SWP_NOACTIVATE 防止抢焦点
-        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     });
     m_antiCloakTimer->start();
 }

@@ -29,8 +29,8 @@ Result<void> LaserSweepEffect::initialize(std::function<void()> glInitFn, int ma
     }
     m_segmentEnergy.assign(m_segmentCount, 0.0f);
     m_segmentRole.assign(m_segmentCount, SegmentRole::HarmonicMain);
-    // 拖尾最多 100 顶点（GL_LINE_STRIP），头部 1 个点
-    m_maxLineVerts  = 100;
+    // 拖尾最多 kLaserTrailMaxVerts 顶点（GL_LINE_STRIP），头部 1 个点
+    m_maxLineVerts  = kLaserTrailMaxVerts;
     m_maxPointVerts = 1;
     m_lineVertices.reserve(m_maxLineVerts);
     m_pointVertices.reserve(m_maxPointVerts);
